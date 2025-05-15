@@ -1,8 +1,13 @@
+from flask import Flask, render_template, request, jsonify
 import time
 import random
 from instagrapi import Client
 from instagrapi.exceptions import ChallengeRequired
-from getpass import getpass
+from threading import Thread
+import secrets
+
+app = Flask(_name_)
+app.secret_key = secrets.token_hex(16)
 
 # ---------------- CONFIG ----------------
 OWNER_USERNAMES = ["your_username"]  # Replace with your username
@@ -53,17 +58,22 @@ RESPONSES = {
     "unlocked": "🔓 Group is unlocked! Everyone can have fun now!",
 }
 
-# ---------------- MAIN BOT ----------------
-cl = Client()
+# ---------------- GLOBALS ----------------
+cl = None
+bot_thread = None
+running = False
 owner_ids = []
 no_abuse_list = []
 locked_groups = {}
 last_group_name_change = {}
+self_user_id = None
 
-def ask_credentials():
-    username = input("Enter your Instagram username: ")
-    password = getpass("Enter your Instagram password: ")
-    return username, password
+# ---------------- HELPER FUNCTIONS ----------------
+def get_random_response(response_type, username=None):
+    template = random.choice(RESPONSES[response_type])
+    if username:
+        return template.format(username=username)
+    return template
 
 def handle_challenge(username):
     print("[*] Login triggered a challenge. Trying to send code to email...")
@@ -73,22 +83,12 @@ def handle_challenge(username):
         cl.challenge_send_security_code(code)
     except Exception as e:
         print("[-] Failed to resolve challenge:", e)
-        exit()
-
-def login_flow():
-    username, password = ask_credentials()
-    try:
-        cl.login(username, password)
-    except ChallengeRequired:
-        handle_challenge(username)
-    except Exception as e:
-        print("[-] Login failed:", e)
-        exit()
-    
-    print(f"[+] Logged in as {username}")
-    return cl.user_id_from_username(username)
+        return False
+    return True
 
 def resolve_owner_ids():
+    global owner_ids
+    owner_ids = []
     for uname in OWNER_USERNAMES:
         try:
             uid = cl.user_id_from_username(uname)
@@ -96,12 +96,6 @@ def resolve_owner_ids():
             print(f"[+] Owner recognized: {uname} (ID: {uid})")
         except:
             print(f"[-] Failed to get user ID for owner '{uname}'")
-
-def get_random_response(response_type, username=None):
-    template = random.choice(RESPONSES[response_type])
-    if username:
-        return template.format(username=username)
-    return template
 
 def process_command(command, sender_id, thread_id, thread_users):
     if not command.startswith(PREFIX):
@@ -198,11 +192,12 @@ def process_command(command, sender_id, thread_id, thread_users):
     
     return False
 
-def monitor_groups(self_id):
-    print("[✓] Monitoring group chats...")
+def bot_loop():
+    global running, owner_ids, self_user_id
+    print("[✓] Bot started monitoring group chats...")
     replied_message_ids = {}
 
-    while True:
+    while running:
         try:
             threads = cl.direct_threads()
             for thread in threads:
@@ -236,7 +231,7 @@ def monitor_groups(self_id):
                             cl.direct_send(greeting, thread_ids=[thread_id])
                         continue
 
-                    if sender_id == self_id:
+                    if sender_id == self_user_id:
                         continue
 
                     # Check if user is in no-abuse list
@@ -259,17 +254,246 @@ def monitor_groups(self_id):
         except Exception as e:
             print(f"[-] Error: {str(e)}")
             time.sleep(10)
+    
+    print("[!] Bot stopped")
 
-# ---------------- START ----------------
-if _name_ == "_main_":
-    print("""
-    ███████╗██╗░░░██╗███████╗██████╗░  ░██████╗░██████╗░░█████╗░████████╗
-    ██╔════╝██║░░░██║██╔════╝██╔══██╗  ██╔════╝░██╔══██╗██╔══██╗╚══██╔══╝
-    █████╗░░╚██╗░██╔╝█████╗░░██████╔╝  ██║░░██╗░██████╔╝███████║░░░██║░░░
-    ██╔══╝░░░╚████╔╝░██╔══╝░░██╔══██╗  ██║░░╚██╗██╔══██╗██╔══██║░░░██║░░░
-    ███████╗░░╚██╔╝░░███████╗██║░░██║  ╚██████╔╝██║░░██║██║░░██║░░░██║░░░
-    ╚══════╝░░░╚═╝░░░╚══════╝╚═╝░░╚═╝  ░╚═════╝░╚═╝░░╚═╝╚═╝░░╚═╝░░░╚═╝░░░
-    """)
-    self_user_id = login_flow()
-    resolve_owner_ids()
-    monitor_groups(self_user_id)
+# ---------------- FLASK ROUTES ----------------
+@app.route('/')
+def index():
+    status = "Running" if running else "Stopped"
+    return render_template('index.html', status=status, owner_usernames=OWNER_USERNAMES)
+
+@app.route('/login', methods=['POST'])
+def login():
+    global cl, running, bot_thread, self_user_id
+    
+    if running:
+        return jsonify({"success": False, "message": "Bot is already running"})
+    
+    username = request.form.get('username')
+    password = request.form.get('password')
+    
+    if not username or not password:
+        return jsonify({"success": False, "message": "Username and password required"})
+    
+    try:
+        cl = Client()
+        cl.login(username, password)
+        self_user_id = cl.user_id_from_username(username)
+        resolve_owner_ids()
+        
+        running = True
+        bot_thread = Thread(target=bot_loop)
+        bot_thread.start()
+        
+        return jsonify({
+            "success": True,
+            "message": f"Logged in as {username} and bot started successfully"
+        })
+    except ChallengeRequired:
+        if handle_challenge(username):
+            try:
+                cl.login(username, password)
+                self_user_id = cl.user_id_from_username(username)
+                resolve_owner_ids()
+                
+                running = True
+                bot_thread = Thread(target=bot_loop)
+                bot_thread.start()
+                
+                return jsonify({
+                    "success": True,
+                    "message": f"Logged in as {username} and bot started successfully"
+                })
+            except Exception as e:
+                return jsonify({"success": False, "message": f"Login failed: {str(e)}"})
+        else:
+            return jsonify({"success": False, "message": "Challenge resolution failed"})
+    except Exception as e:
+        return jsonify({"success": False, "message": f"Login failed: {str(e)}"})
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    global running, bot_thread, cl
+    
+    if not running:
+        return jsonify({"success": False, "message": "Bot is not running"})
+    
+    running = False
+    if bot_thread:
+        bot_thread.join()
+    
+    if cl:
+        try:
+            cl.logout()
+        except:
+            pass
+        cl = None
+    
+    return jsonify({"success": True, "message": "Bot stopped and logged out successfully"})
+
+@app.route('/status')
+def status():
+    return jsonify({"running": running})
+
+# ---------------- TEMPLATE ----------------
+@app.route('/template')
+def template():
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Instagram Group Bot</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #405DE6;
+            text-align: center;
+        }
+        .status {
+            padding: 10px;
+            text-align: center;
+            margin: 20px 0;
+            border-radius: 5px;
+            font-weight: bold;
+        }
+        .running {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .stopped {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        form {
+            margin-top: 20px;
+        }
+        input, button {
+            padding: 10px;
+            margin: 5px 0;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: #405DE6;
+            color: white;
+            border: none;
+            cursor: pointer;
+            border-radius: 5px;
+        }
+        button:hover {
+            background-color: #3447b6;
+        }
+        .owner-list {
+            margin: 20px 0;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Instagram Group Bot</h1>
+        
+        <div id="status" class="status"></div>
+        
+        <div class="owner-list">
+            <h3>Bot Owners:</h3>
+            <ul id="owner-list">
+                {% for owner in owner_usernames %}
+                    <li>@{{ owner }}</li>
+                {% endfor %}
+            </ul>
+        </div>
+        
+        <div id="login-form">
+            <h3>Login to Start Bot</h3>
+            <form onsubmit="event.preventDefault(); login();">
+                <input type="text" id="username" placeholder="Instagram Username" required>
+                <input type="password" id="password" placeholder="Instagram Password" required>
+                <button type="submit">Login & Start Bot</button>
+            </form>
+        </div>
+        
+        <div id="logout-form" style="display: none;">
+            <form onsubmit="event.preventDefault(); logout();">
+                <button type="submit">Stop Bot & Logout</button>
+            <p id="bot-message"></p>
+        </div>
+    </div>
+
+    <script>
+        function updateStatus() {
+            fetch('/status')
+                .then(response => response.json())
+                .then(data => {
+                    const statusDiv = document.getElementById('status');
+                    if (data.running) {
+                        statusDiv.textContent = 'Status: Running';
+                        statusDiv.className = 'status running';
+                        document.getElementById('login-form').style.display = 'none';
+                        document.getElementById('logout-form').style.display = 'block';
+                    } else {
+                        statusDiv.textContent = 'Status: Stopped';
+                        statusDiv.className = 'status stopped';
+                        document.getElementById('login-form').style.display = 'block';
+                        document.getElementById('logout-form').style.display = 'none';
+                    }
+                });
+        }
+        
+        function login() {
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            
+            fetch('/login', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}
+            })
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('bot-message').textContent = data.message;
+                if (data.success) {
+                    updateStatus();
+                } else {
+                    alert(data.message);
+                }
+            });
+        }
+        
+        function logout() {
+            fetch('/logout', {
+                method: 'POST'
+            })
+            .then(response => response.json())
+            .then(data => {
+                document.getElementById('bot-message').textContent = data.message;
+                updateStatus();
+            });
+        }
+        
+        // Initial status check
+        updateStatus();
+    </script>
+</body>
+</html>
+"""
+
+if _name_ == '_main_':
+    app.run(debug=True)
